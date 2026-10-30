@@ -531,7 +531,15 @@ struct Broker
   const rmw_ipc_serialized_api_t * encoded_api = nullptr;
   std::shared_ptr<void> library;
   std::vector<std::weak_ptr<Subscription>> subscriptions;
+  // Readers take messages of other processes through the broker only while this context
+  // publishes the topic too, so that the two kinds of message share one queue and order.
+  std::map<std::string, size_t> local_publishers;
 };
+std::string endpoint_key(const std::string & topic, const rosidl_type_hash_t & hash)
+{
+  return topic + '\0' + std::string(reinterpret_cast<const char *>(hash.value),
+           sizeof(hash.value)) + static_cast<char>(hash.version);
+}
 struct Publisher
 {
   Broker * broker;
@@ -682,6 +690,67 @@ rmw_ret_t prepare(
     return RMW_RET_BAD_ALLOC;
   }
 }
+bool subscription_ready(void * value)
+{
+  return static_cast<Subscription *>(value)->ready.load(std::memory_order_acquire) > 0;
+}
+rmw_ipc_ingress_result_t subscription_ingress(
+  void * value, void * input, rmw_ipc_decode_fn decode, const rmw_message_info_t * info)
+{
+  auto sub = static_cast<Subscription *>(value);
+  try {
+    std::shared_ptr<Publication> shared;
+    if (sub->serialized.load(std::memory_order_acquire)) {
+      auto bytes = std::make_shared<Serialized>();
+      if (sub->encoded_api->copy_ingress(input, &bytes->value) != RMW_RET_OK) {
+        return {0, nullptr, nullptr};
+      }
+      shared = publication({}, sub->type);
+      shared->encoded_source = true;
+      shared->serialized = bytes;
+      shared->serialization_attempted = true;
+    } else {
+      auto data = std::malloc(sub->type->size());
+      if (!data) {return {0, nullptr, nullptr};}
+      sub->type->init(data);
+      auto owner = std::shared_ptr<void>(data, [type = sub->type](void * p) {
+            type->fini(p); std::free(p);
+        });
+      if (!decode(input, data)) {return {0, nullptr, nullptr};}
+      shared = publication(owner, sub->type);
+    }
+    auto retired = std::make_unique<Sample>();
+    std::lock_guard<std::mutex> lock(sub->mutex);
+    if (sub->closed) {return {0, nullptr, nullptr};}
+    Gid writer;
+    std::copy_n(info->publisher_gid.data, writer.size(), writer.begin());
+    sub->admitted[writer] = info->publication_sequence_number;
+    bool grew = sub->queue.size() < sub->qos.depth;
+    if (!grew) {
+      *retired = std::move(sub->queue.front());
+      sub->queue.erase(sub->queue.begin());
+    }
+    auto metadata = *info;
+    metadata.reception_sequence_number = sub->reception++;
+    sub->queue.push_back(Sample{shared, metadata});
+    sub->ready.store(sub->queue.size(), std::memory_order_release);
+    return {grew ? 2 : 1, retired.release(), [](void * p) {delete static_cast<Sample *>(p);}};
+  } catch (const std::bad_alloc &) {
+    return {0, nullptr, nullptr};
+  }
+}
+// Called with the broker mutex held.
+void set_ingress(Broker & broker, const std::string & key, bool enabled)
+{
+  for (auto & weak : broker.subscriptions) {
+    auto sub = weak.lock();
+    if (!sub || endpoint_key(sub->topic, sub->hash) != key) {continue;}
+    std::lock_guard<std::mutex> notify_lock(sub->notify_mutex);
+    if (sub->closed) {continue;}
+    sub->api->configure_subscription(sub->rmw, subscription_ready,
+      enabled ? subscription_ingress : nullptr, sub.get(), nullptr);
+  }
+}
 }  // namespace
 namespace rcl_ipc
 {
@@ -793,15 +862,29 @@ void rcl_ipc_publisher_init(
       !supported(publisher->impl->actual_qos)) {return;}
     auto type = schema(support);
     if (!type) {return;}
-    publisher->impl->ipc = new Publisher{broker, rcl_publisher_get_topic_name(publisher),
-      publisher->impl->type_hash, publisher->impl->actual_qos, type};
+    std::unique_ptr<Publisher> pub(new Publisher{broker, rcl_publisher_get_topic_name(publisher),
+        publisher->impl->type_hash, publisher->impl->actual_qos, type});
+    auto key = endpoint_key(pub->topic, pub->hash);
+    std::lock_guard<std::mutex> lock(broker->mutex);
+    if (++broker->local_publishers[key] == 1) {set_ingress(*broker, key, true);}
+    publisher->impl->ipc = pub.release();
   } catch (const std::bad_alloc &) {
     return;
   }
 }
 void rcl_ipc_publisher_fini(rcl_publisher_t * publisher)
 {
-  delete static_cast<Publisher *>(publisher->impl->ipc);
+  auto pub = static_cast<Publisher *>(publisher->impl->ipc);
+  if (pub) {
+    auto key = endpoint_key(pub->topic, pub->hash);
+    std::lock_guard<std::mutex> lock(pub->broker->mutex);
+    auto count = pub->broker->local_publishers.find(key);
+    if (--count->second == 0) {
+      pub->broker->local_publishers.erase(count);
+      set_ingress(*pub->broker, key, false);
+    }
+  }
+  delete pub;
   publisher->impl->ipc = nullptr;
 }
 void rcl_ipc_subscription_init(
@@ -832,52 +915,9 @@ void rcl_ipc_subscription_init(
       }), broker->subscriptions.end());
     broker->subscriptions.reserve(broker->subscriptions.size() + 1);
     auto holder = std::make_unique<std::shared_ptr<Subscription>>(sub);
-    broker->api->configure_subscription(sub->rmw, [](void * value) {
-        return static_cast<Subscription *>(value)->ready.load(std::memory_order_acquire) > 0;
-    }, [](void * value, void * input, rmw_ipc_decode_fn decode,
-      const rmw_message_info_t * info) -> rmw_ipc_ingress_result_t {
-        auto sub = static_cast<Subscription *>(value);
-        try {
-          std::shared_ptr<Publication> shared;
-          if (sub->serialized.load(std::memory_order_acquire)) {
-            auto bytes = std::make_shared<Serialized>();
-            if (sub->encoded_api->copy_ingress(input, &bytes->value) != RMW_RET_OK) {
-              return {0, nullptr, nullptr};
-            }
-            shared = publication({}, sub->type);
-            shared->encoded_source = true;
-            shared->serialized = bytes;
-            shared->serialization_attempted = true;
-          } else {
-            auto data = std::malloc(sub->type->size());
-            if (!data) {return {0, nullptr, nullptr};}
-            sub->type->init(data);
-            auto owner = std::shared_ptr<void>(data, [type = sub->type](void * p) {
-              type->fini(p); std::free(p);
-              });
-            if (!decode(input, data)) {return {0, nullptr, nullptr};}
-            shared = publication(owner, sub->type);
-          }
-          auto retired = std::make_unique<Sample>();
-          std::lock_guard<std::mutex> lock(sub->mutex);
-          if (sub->closed) {return {0, nullptr, nullptr};}
-          Gid writer;
-          std::copy_n(info->publisher_gid.data, writer.size(), writer.begin());
-          sub->admitted[writer] = info->publication_sequence_number;
-          bool grew = sub->queue.size() < sub->qos.depth;
-          if (!grew) {
-            *retired = std::move(sub->queue.front());
-            sub->queue.erase(sub->queue.begin());
-          }
-          auto metadata = *info;
-          metadata.reception_sequence_number = sub->reception++;
-          sub->queue.push_back(Sample{shared, metadata});
-          sub->ready.store(sub->queue.size(), std::memory_order_release);
-          return {grew ? 2 : 1, retired.release(), [](void * p) {delete static_cast<Sample *>(p);}};
-        } catch (const std::bad_alloc &) {
-          return {0, nullptr, nullptr};
-        }
-    }, sub.get(), sub->gid.data());
+    broker->api->configure_subscription(sub->rmw, subscription_ready,
+      broker->local_publishers.count(endpoint_key(sub->topic, sub->hash)) ?
+      subscription_ingress : nullptr, sub.get(), sub->gid.data());
     broker->subscriptions.push_back(sub);
     subscription->impl->ipc = holder.release();
   } catch (const std::bad_alloc &) {

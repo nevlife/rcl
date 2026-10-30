@@ -566,6 +566,88 @@ TEST_F(BrokerTest, SeparateContextUsesRmw)
   EXPECT_EQ(0, rcl_context_fini(&other));
 }
 
+TEST_F(BrokerTest, RemoteMessagesUseTheBrokerOnlyWhileALocalPublisherExists)
+{
+  auto other = rcl_get_zero_initialized_context();
+  auto options = rcl_get_zero_initialized_init_options();
+  ASSERT_EQ(0, rcl_init_options_init(&options, rcl_get_default_allocator()));
+  ASSERT_EQ(0, rcl_init(0, nullptr, &options, &other));
+  ASSERT_EQ(0, rcl_init_options_fini(&options));
+  auto other_node = rcl_get_zero_initialized_node();
+  auto no = rcl_node_get_default_options();
+  no.enable_rosout = false;
+  ASSERT_EQ(0, rcl_node_init(&other_node, "other_context", "/", &other, &no));
+  auto support = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Image);
+  auto po = rcl_publisher_get_default_options();
+  auto remote = rcl_get_zero_initialized_publisher();
+  ASSERT_EQ(0, rcl_publisher_init(&remote, &other_node, support, "/remote_only", &po));
+  auto so = rcl_subscription_get_default_options();
+  auto sub = rcl_get_zero_initialized_subscription();
+  ASSERT_EQ(0, rcl_subscription_init(&sub, &node, support, "/remote_only", &so));
+  ASSERT_TRUE(rcl_subscription_is_ipc_enabled(&sub));
+  size_t matches = 0;
+  for (int i = 0; i < 200 && matches < 1; ++i) {
+    ASSERT_EQ(0, rcl_publisher_get_subscription_count(&remote, &matches));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(1u, matches);
+  auto message = sensor_msgs__msg__Image__create();
+  auto publish = [&](rcl_publisher_t * from, uint32_t n) {
+      message->height = n;
+      EXPECT_EQ(0, rcl_publish(from, message, nullptr));
+    };
+  // A remote message is taken from the rmw, so the broker never decodes or copies it.
+  auto expect_rmw_take = [&](uint32_t n) {
+      rmw_message_info_t info{};
+      rcl_ret_t result = RCL_RET_SUBSCRIPTION_TAKE_FAILED;
+      for (int i = 0; i < 500 && result != RCL_RET_OK; ++i) {
+        rcl_ipc_message_t * owner = nullptr;
+        const void * data = nullptr;
+        ASSERT_EQ(RCL_RET_SUBSCRIPTION_TAKE_FAILED,
+          rcl_take_ipc_message(&sub, &owner, &data, &info));
+        result = rcl_take(&sub, message, &info, nullptr);
+        if (result != RCL_RET_OK) {std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+      }
+      ASSERT_EQ(0, result);
+      EXPECT_EQ(n, message->height);
+    };
+  auto expect_broker_take = [&](uint32_t n, bool local) {
+      rmw_message_info_t info{};
+      rcl_ipc_message_t * owner = nullptr;
+      const void * data = nullptr;
+      rcl_ret_t result = RCL_RET_SUBSCRIPTION_TAKE_FAILED;
+      for (int i = 0; i < 500 && result != RCL_RET_OK; ++i) {
+        result = rcl_take_ipc_message(&sub, &owner, &data, &info);
+        if (result != RCL_RET_OK) {std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+      }
+      ASSERT_EQ(0, result);
+      EXPECT_EQ(n, static_cast<const sensor_msgs__msg__Image *>(data)->height);
+      EXPECT_EQ(local, info.from_intra_process);
+      rcl_ipc_message_release(owner);
+    };
+  publish(&remote, 1);
+  expect_rmw_take(1);
+  auto local = rcl_get_zero_initialized_publisher();
+  ASSERT_EQ(0, rcl_publisher_init(&local, &node, support, "/remote_only", &po));
+  for (int i = 0; i < 200 && matches < 2; ++i) {
+    ASSERT_EQ(0, rcl_publisher_get_subscription_count(&local, &matches));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  publish(&remote, 2);
+  expect_broker_take(2, false);
+  publish(&local, 3);
+  expect_broker_take(3, true);
+  ASSERT_EQ(0, rcl_publisher_fini(&local, &node));
+  publish(&remote, 4);
+  expect_rmw_take(4);
+  sensor_msgs__msg__Image__destroy(message);
+  EXPECT_EQ(0, rcl_subscription_fini(&sub, &node));
+  EXPECT_EQ(0, rcl_publisher_fini(&remote, &other_node));
+  EXPECT_EQ(0, rcl_node_fini(&other_node));
+  EXPECT_EQ(0, rcl_shutdown(&other));
+  EXPECT_EQ(0, rcl_context_fini(&other));
+}
+
 TEST_F(BrokerTest, CommonExecutorBacklogAndDepthCredits)
 {
   send(1); send(2); send(3); send(4);
